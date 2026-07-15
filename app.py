@@ -5,14 +5,17 @@ OBV Trend- & Divergenzanalyse
 Streamlit-App zur automatisierten On-Balance-Volume (OBV) Analyse von Aktien.
 
 Funktionen:
-    - Ticker-Eingabe manuell (Textfeld, kommagetrennt) ODER per Excel-Upload
-    - Automatische Auflösung europäischer Ticker ohne Börsen-Suffix
+    - Ticker-Eingabe manuell (Textfeld, kommagetrennt, inkl. WKN für deutsche
+      Werte) ODER per Excel-Upload (inkl. WKN-Spaltenerkennung)
+    - Automatische Auflösung europäischer Ticker/WKNs ohne Börsen-Suffix
       (z. B. "BMW" -> "BMW.DE") über Suffix-Heuristik + Yahoo-Finance-Suche
     - Analyse-Zeitraum wählbar: 1 Woche, 1 Monat, 3 Monate, 6 Monate, 1 Jahr
     - Abruf historischer Kurs-/Volumendaten via yfinance
     - Berechnung des On-Balance-Volume (OBV)
     - Trend- und Divergenzanalyse (Kurs vs. OBV) über die letzten Handelstage
     - Durchschnittliches Analystenkursziel je Ticker (sofern von Yahoo Finance geführt)
+    - Vergleich aktueller Kurs vs. Analystenkursziel (Über-/Unterbewertung in %)
+    - Alle Kurse einheitlich in Euro (Live-Umrechnung über Yahoo-FX-Kurse)
     - Interaktive Ergebnistabelle in der App (deutsches Zahlenformat)
     - Download des Ergebnisses als formatierte Excel-Datei (.xlsx)
 
@@ -67,7 +70,9 @@ LOOKBACK_DAYS = 15  # liegt im geforderten Korridor von 10 bis 20 Handelstagen
 TREND_SLOPE_THRESHOLD = 0.001
 
 # Spaltennamen, nach denen beim Excel-Import gesucht wird (case-insensitive).
-TICKER_COLUMN_CANDIDATES = ["ticker", "symbol", "aktie", "wertpapier"]
+# "wkn" ergänzt, damit Broker-Exports mit Wertpapierkennnummer statt Ticker
+# (z. B. von Trade Republic/comdirect) automatisch erkannt werden.
+TICKER_COLUMN_CANDIDATES = ["ticker", "symbol", "aktie", "wertpapier", "wkn", "wertpapierkennnummer"]
 
 # Pflicht-Disclaimer für alle Aktien-/Finanzanalyse-Apps.
 DISCLAIMER_TEXT = (
@@ -91,6 +96,15 @@ EXCHANGE_SUFFIXES = [
     ".VI",  # Wiener Börse
 ]
 
+# Yahoo Finance meldet Kurse von London-notierten Werten oft in Pence statt
+# Pfund (Währungscode "GBp"/"GBX"). Für die EUR-Umrechnung muss das vorher
+# durch 100 geteilt werden, sonst wäre der Wert um Faktor 100 zu hoch.
+PENCE_CURRENCIES = {"GBp", "GBX"}
+
+# Cache für bereits abgerufene Wechselkurse innerhalb einer App-Sitzung, damit
+# nicht pro Ticker erneut derselbe FX-Kurs abgerufen werden muss.
+_FX_RATE_CACHE: dict[str, float | None] = {}
+
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen: Ticker-Eingabe (manuell & Excel-Upload)
@@ -109,8 +123,8 @@ def extract_tickers_from_excel(uploaded_file) -> list[str]:
     Liest eine hochgeladene Excel-Datei ein und extrahiert die Ticker-Spalte.
 
     Sucht case-insensitive nach gängigen Spaltennamen (ticker, symbol, aktie,
-    wertpapier). Wird keine passende Spalte gefunden, wird die erste Spalte
-    der Tabelle verwendet.
+    wertpapier, wkn). Wird keine passende Spalte gefunden, wird die erste
+    Spalte der Tabelle verwendet.
     """
     df = pd.read_excel(uploaded_file)
 
@@ -151,7 +165,7 @@ def get_ticker_list(input_mode: str, manual_text: str, uploaded_file) -> list[st
 
 
 # ---------------------------------------------------------------------------
-# Ticker-Auflösung (Börsen-Suffix-Heuristik + Yahoo-Suche) & Datenabruf
+# Ticker-Auflösung (Ticker, WKN, ISIN -> Yahoo-Symbol) & Datenabruf
 # ---------------------------------------------------------------------------
 
 def _try_symbol(symbol: str, period: str):
@@ -177,38 +191,27 @@ def _try_symbol(symbol: str, period: str):
         return None
 
 
-def resolve_ticker(raw_ticker: str, period: str) -> tuple[str, "yf.Ticker", pd.DataFrame]:
+def _search_candidates(query: str, period: str):
     """
-    Löst einen rohen Ticker-Code in ein gültiges Yahoo-Finance-Symbol auf und
-    lädt dabei direkt die passende Kurshistorie.
-
-    Viele europäische Broker-Exports (z. B. Trade Republic, comdirect) führen
-    Aktien ohne Börsen-Suffix (z. B. "BMW" statt "BMW.DE"). Yahoo Finance
-    benötigt für Nicht-US-Börsen aber i. d. R. ein Suffix. Auflösungs-Reihenfolge:
-
-        1. Ticker wie eingegeben probieren (deckt US-Ticker sowie bereits
-           korrekt angegebene Symbole wie "BMW.DE" ab).
-        2. Yahoo-Finance-Volltextsuche (yfinance.Search) - findet in der
-           Praxis meist direkt das richtige Symbol samt Börsenplatz.
-        3. Als letzter Fallback: gängige europäische Börsensuffixe (siehe
-           EXCHANGE_SUFFIXES) systematisch durchprobieren.
-
-    Gibt (aufgelöstes_symbol, ticker_obj, hist) zurück oder wirft eine
-    ValueError, wenn keiner der drei Wege zu verwertbaren Daten führt.
+    Fragt die Yahoo-Finance-Volltextsuche ab und liefert (symbol, ticker_obj,
+    hist) für den ersten Treffer mit verwertbaren Kursdaten zurück, sonst
+    None. Nimmt in einem ersten Durchlauf nur Treffer vom Typ "EQUITY" (echte
+    Aktien statt z. B. News/Optionen), im zweiten Durchlauf alle Treffer -
+    das verbessert die Trefferqualität bei mehrdeutigen Suchbegriffen wie
+    einer WKN.
     """
-    # 1) Roher Ticker wie eingegeben.
-    found = _try_symbol(raw_ticker, period)
-    if found is not None:
-        return raw_ticker, found[0], found[1]
-
-    # 2) Yahoo-Finance-Suche (liefert i. d. R. bereits das korrekte,
-    #    börsenspezifische Symbol als Top-Treffer).
     try:
-        search_results = yf.Search(raw_ticker, max_results=5).quotes
+        quotes = yf.Search(query, max_results=8).quotes
     except Exception:
-        search_results = []
+        quotes = []
 
-    for quote in search_results:
+    if not quotes:
+        return None
+
+    equity_quotes = [q for q in quotes if q.get("quoteType") == "EQUITY"]
+    other_quotes = [q for q in quotes if q.get("quoteType") != "EQUITY"]
+
+    for quote in equity_quotes + other_quotes:
         symbol = quote.get("symbol")
         if not symbol:
             continue
@@ -216,9 +219,43 @@ def resolve_ticker(raw_ticker: str, period: str) -> tuple[str, "yf.Ticker", pd.D
         if found is not None:
             return symbol, found[0], found[1]
 
+    return None
+
+
+def resolve_ticker(raw_ticker: str, period: str) -> tuple[str, "yf.Ticker", pd.DataFrame]:
+    """
+    Löst einen rohen Ticker-Code, eine WKN oder eine ISIN in ein gültiges
+    Yahoo-Finance-Symbol auf und lädt dabei direkt die passende Kurshistorie.
+
+    Viele europäische Broker-Exports (z. B. Trade Republic, comdirect) führen
+    Aktien ohne Börsen-Suffix (z. B. "BMW" statt "BMW.DE") oder nur mit WKN
+    (z. B. "716460" für BMW). Auflösungs-Reihenfolge:
+
+        1. Eingabe wie angegeben probieren (deckt US-Ticker sowie bereits
+           korrekt angegebene Symbole wie "BMW.DE" ab).
+        2. Yahoo-Finance-Volltextsuche (yfinance.Search) - findet in der
+           Praxis auch WKN und ISIN, da Yahoo diese für europäische Werte
+           mitindiziert, und liefert direkt das korrekte Börsensymbol.
+        3. Als letzter Fallback: gängige europäische Börsensuffixe (siehe
+           EXCHANGE_SUFFIXES) systematisch durchprobieren.
+
+    Gibt (aufgelöstes_symbol, ticker_obj, hist) zurück oder wirft eine
+    ValueError, wenn keiner der drei Wege zu verwertbaren Daten führt.
+    """
+    # 1) Eingabe wie angegeben (Ticker oder bereits korrektes Yahoo-Symbol).
+    found = _try_symbol(raw_ticker, period)
+    if found is not None:
+        return raw_ticker, found[0], found[1]
+
+    # 2) Yahoo-Finance-Suche - deckt Ticker, WKN und ISIN ab.
+    search_result = _search_candidates(raw_ticker, period)
+    if search_result is not None:
+        return search_result
+
     # 3) Suffix-Heuristik als letzter Fallback (nur wenn kein Suffix bereits
     #    im Ticker enthalten ist - sonst würden unsinnige Kombinationen wie
-    #    "BMW.DE.SW" entstehen).
+    #    "BMW.DE.SW" entstehen). Für reine WKN-Eingaben (nur Ziffern/Buchstaben
+    #    ohne Punkt) ebenfalls sinnvoll, falls die Suche nichts fand.
     if "." not in raw_ticker:
         for suffix in EXCHANGE_SUFFIXES:
             candidate = f"{raw_ticker}{suffix}"
@@ -228,16 +265,79 @@ def resolve_ticker(raw_ticker: str, period: str) -> tuple[str, "yf.Ticker", pd.D
 
     raise ValueError(
         f"Kein gültiges Yahoo-Finance-Symbol für '{raw_ticker}' gefunden - "
-        f"auch nicht über die Yahoo-Suche oder gängige Börsensuffixe "
-        f"(.DE/.SW/.L/...). Ticker ggf. mit explizitem Börsenkürzel angeben, "
-        f"z. B. '{raw_ticker}.DE'."
+        f"auch nicht über die Yahoo-Suche (Ticker/WKN/ISIN) oder gängige "
+        f"Börsensuffixe (.DE/.SW/.L/...). Ticker ggf. mit explizitem "
+        f"Börsenkürzel angeben, z. B. '{raw_ticker}.DE'."
     )
+
+
+def get_fx_rate_to_eur(currency: str) -> float | None:
+    """
+    Ermittelt den aktuellen Wechselkurs von `currency` nach EUR über den
+    Yahoo-Finance-FX-Ticker "{currency}EUR=X" (Konvention: "AAABBB=X" zeigt
+    an, wie viele Einheiten BBB man für 1 Einheit AAA erhält - "USDEUR=X"
+    liefert also den EUR-Gegenwert von 1 USD).
+
+    Nutzt einen einfachen In-Memory-Cache pro Sitzung, damit derselbe Kurs
+    nicht für jeden Ticker erneut abgerufen wird. Gibt None zurück, wenn der
+    Kurs nicht ermittelt werden konnte (z. B. FX-Paar nicht verfügbar).
+    """
+    if currency in _FX_RATE_CACHE:
+        return _FX_RATE_CACHE[currency]
+
+    rate: float | None = None
+    try:
+        fx_ticker = yf.Ticker(f"{currency}EUR=X")
+        hist = fx_ticker.history(period="5d")
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            close_values = hist["Close"].dropna()
+            if not close_values.empty:
+                rate = float(close_values.iloc[-1])
+    except Exception:
+        rate = None
+
+    _FX_RATE_CACHE[currency] = rate
+    return rate
+
+
+def convert_to_eur(value: float | None, currency: str) -> float | None:
+    """
+    Rechnet einen Kurswert von der Handelswährung in Euro um.
+
+    Behandelt den Sonderfall britischer Pence (Währungscode "GBp"/"GBX",
+    von Yahoo für London-notierte Werte verwendet) korrekt, indem zunächst
+    durch 100 geteilt wird (Pence -> Pfund), bevor der GBP/EUR-Kurs
+    angewendet wird.
+
+    Gibt None zurück, wenn keine Umrechnung möglich ist (z. B. unbekannte
+    Währung oder FX-Kurs nicht abrufbar) - der Aufrufer zeigt in diesem
+    seltenen Fall den Originalwert unverändert an, statt abzustürzen.
+    """
+    if value is None:
+        return None
+    if not currency or currency == "n/a":
+        return None
+
+    normalized_currency = currency
+    divisor = 1.0
+    if currency in PENCE_CURRENCIES:
+        normalized_currency = "GBP"
+        divisor = 100.0
+
+    if normalized_currency == "EUR":
+        return round(value / divisor, 2)
+
+    rate = get_fx_rate_to_eur(normalized_currency)
+    if rate is None:
+        return None
+
+    return round((value / divisor) * rate, 2)
 
 
 def fetch_price_history(ticker: str, period: str) -> tuple[pd.DataFrame, dict]:
     """
     Ruft historische Kurs- und Volumendaten für einen Ticker ab (inkl.
-    automatischer Ticker-Auflösung, siehe resolve_ticker).
+    automatischer Ticker-/WKN-/ISIN-Auflösung, siehe resolve_ticker).
 
     Gibt ein DataFrame mit den Spalten 'Close' und 'Volume' sowie ein
     Meta-Dict (Name, Handelswährung, durchschnittliches Analystenkursziel,
@@ -374,46 +474,7 @@ def analyze_trend_divergence(df: pd.DataFrame, lookback: int = LOOKBACK_DAYS) ->
 
 
 # ---------------------------------------------------------------------------
-# Analyse-Pipeline pro Ticker
-# ---------------------------------------------------------------------------
-
-def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
-    """
-    Führt die vollständige Analyse für einen einzelnen Ticker aus.
-
-    Gibt ein Tupel (Ergebnis-Dict, Fehlermeldung) zurück. Genau eines der
-    beiden Elemente ist None - so kann der Aufrufer sauber zwischen Erfolg
-    und Fehlschlag unterscheiden, ohne die App abstürzen zu lassen.
-    """
-    try:
-        hist, meta = fetch_price_history(ticker, period)
-        hist_with_obv = calculate_obv(hist)
-
-        if len(hist_with_obv) < 2:
-            return None, f"{ticker}: Zu wenige Datenpunkte für eine Analyse."
-
-        bewertung = analyze_trend_divergence(hist_with_obv, LOOKBACK_DAYS)
-
-        avg_target = meta.get("avg_analyst_target")
-
-        result = {
-            "Ticker": ticker,
-            "Name": meta.get("name") or ticker,
-            "Währung": meta.get("currency", "n/a"),
-            "Aktueller Kurs": round(float(hist_with_obv["Close"].iloc[-1]), 2),
-            "Durchschnittliches Analystenkursziel": round(avg_target, 2) if avg_target is not None else None,
-            "Letztes Volumen": int(hist_with_obv["Volume"].iloc[-1]),
-            "Aktueller OBV-Wert": int(hist_with_obv["OBV"].iloc[-1]),
-            "Trend-Bestätigung / Divergenz": bewertung,
-        }
-        return result, None
-
-    except Exception as exc:  # noqa: BLE001 - bewusst breit, damit kein Ticker die App killt
-        return None, f"{ticker}: Analyse fehlgeschlagen ({exc})."
-
-
-# ---------------------------------------------------------------------------
-# Deutsches Zahlenformat für die Bildschirmanzeige
+# Deutsches Zahlenformat (wird bereits hier gebraucht: compare_price_to_target)
 # ---------------------------------------------------------------------------
 
 def format_de_number(value, decimals: int = 2) -> str:
@@ -438,6 +499,87 @@ def format_de_number(value, decimals: int = 2) -> str:
     return us_formatted.replace(",", "§").replace(".", ",").replace("§", ".")
 
 
+# ---------------------------------------------------------------------------
+# Vergleich: aktueller Kurs vs. durchschnittliches Analystenkursziel
+# ---------------------------------------------------------------------------
+
+def compare_price_to_target(current_price: float | None, avg_target: float | None) -> str:
+    """
+    Vergleicht den aktuellen Kurs mit dem durchschnittlichen Analystenkursziel
+    (beide bereits in Euro umgerechnet) und gibt einen lesbaren Text mit
+    prozentualer Abweichung zurück, z. B. "12,34 % über Kursziel" oder
+    "8,50 % unter Kursziel".
+
+    Gibt "keine Analysten-Coverage" zurück, wenn kein Analystenkursziel oder
+    kein umgerechneter Kurs vorliegt, oder das Kursziel 0 ist (Division durch
+    0 vermeiden). Bewusst NICHT "n/a" verwendet: pandas/Excel-Re-Importe
+    interpretieren "n/a" oft automatisch als fehlenden Wert (NaN) statt als
+    Text.
+    """
+    if current_price is None or avg_target is None or avg_target == 0:
+        return "keine Analysten-Coverage"
+
+    diff_pct = (current_price - avg_target) / avg_target * 100
+    diff_pct_str = format_de_number(abs(diff_pct), 2)
+
+    if diff_pct > 0.005:
+        return f"{diff_pct_str} % über Kursziel"
+    if diff_pct < -0.005:
+        return f"{diff_pct_str} % unter Kursziel"
+    return "genau auf Kursziel"
+
+
+# ---------------------------------------------------------------------------
+# Analyse-Pipeline pro Ticker
+# ---------------------------------------------------------------------------
+
+def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
+    """
+    Führt die vollständige Analyse für einen einzelnen Ticker aus.
+
+    Gibt ein Tupel (Ergebnis-Dict, Fehlermeldung) zurück. Genau eines der
+    beiden Elemente ist None - so kann der Aufrufer sauber zwischen Erfolg
+    und Fehlschlag unterscheiden, ohne die App abstürzen zu lassen.
+    """
+    try:
+        hist, meta = fetch_price_history(ticker, period)
+        hist_with_obv = calculate_obv(hist)
+
+        if len(hist_with_obv) < 2:
+            return None, f"{ticker}: Zu wenige Datenpunkte für eine Analyse."
+
+        bewertung = analyze_trend_divergence(hist_with_obv, LOOKBACK_DAYS)
+
+        native_currency = meta.get("currency", "n/a")
+        native_price = float(hist_with_obv["Close"].iloc[-1])
+        native_target = meta.get("avg_analyst_target")
+
+        # Alle Kurse einheitlich in Euro anzeigen (Live-Wechselkurs). Falls
+        # die Umrechnung ausnahmsweise nicht möglich ist (z. B. FX-Paar bei
+        # Yahoo nicht verfügbar), wird als Fallback der Originalwert in der
+        # Handelswährung übernommen, damit kein Wert verloren geht.
+        eur_price = convert_to_eur(native_price, native_currency)
+        if eur_price is None:
+            eur_price = round(native_price, 2)
+        eur_target = convert_to_eur(native_target, native_currency) if native_target is not None else None
+
+        result = {
+            "Ticker": ticker,
+            "Name": meta.get("name") or ticker,
+            "Ursprüngliche Währung": native_currency,
+            "Aktueller Kurs (EUR)": eur_price,
+            "Durchschnittliches Analystenkursziel (EUR)": eur_target,
+            "Kurs über oder unter Analystenziel": compare_price_to_target(eur_price, eur_target),
+            "Letztes Volumen": int(hist_with_obv["Volume"].iloc[-1]),
+            "Aktueller OBV-Wert": int(hist_with_obv["OBV"].iloc[-1]),
+            "Trend-Bestätigung / Divergenz": bewertung,
+        }
+        return result, None
+
+    except Exception as exc:  # noqa: BLE001 - bewusst breit, damit kein Ticker die App killt
+        return None, f"{ticker}: Analyse fehlgeschlagen ({exc})."
+
+
 def build_display_dataframe(result_df: pd.DataFrame) -> pd.DataFrame:
     """
     Erstellt eine Anzeige-Kopie des Ergebnis-DataFrames mit Zahlen im
@@ -448,7 +590,7 @@ def build_display_dataframe(result_df: pd.DataFrame) -> pd.DataFrame:
     """
     display_df = result_df.copy()
 
-    two_decimal_cols = ["Aktueller Kurs", "Durchschnittliches Analystenkursziel"]
+    two_decimal_cols = ["Aktueller Kurs (EUR)", "Durchschnittliches Analystenkursziel (EUR)"]
     zero_decimal_cols = ["Letztes Volumen", "Aktueller OBV-Wert"]
 
     for col in two_decimal_cols:
@@ -498,10 +640,16 @@ def build_excel_bytes(result_df: pd.DataFrame) -> bytes:
         # Textspalten: linksbündig. Alle übrigen Spalten (Zahlen) rechtsbündig,
         # 2 Nachkommastellen + Tausenderpunkt bzw. 0 Nachkommastellen gemäß
         # globalem Zahlenformat-Standard.
-        text_columns = {"Ticker", "Name", "Währung", "Trend-Bestätigung / Divergenz"}
+        text_columns = {
+            "Ticker",
+            "Name",
+            "Ursprüngliche Währung",
+            "Kurs über oder unter Analystenziel",
+            "Trend-Bestätigung / Divergenz",
+        }
         number_format_map = {
-            "Aktueller Kurs": "#,##0.00",
-            "Durchschnittliches Analystenkursziel": "#,##0.00",
+            "Aktueller Kurs (EUR)": "#,##0.00",
+            "Durchschnittliches Analystenkursziel (EUR)": "#,##0.00",
             "Letztes Volumen": "#,##0",
             "Aktueller OBV-Wert": "#,##0",
         }
@@ -565,11 +713,14 @@ def main() -> None:
     st.title("📊 OBV Trend- & Divergenzanalyse")
     st.caption(
         "Berechnet das On-Balance-Volume (OBV) für beliebige Aktien und vergleicht "
-        "den Kurstrend mit dem OBV-Trend, um Trendbestätigungen und Divergenzen "
-        "zu erkennen. Kurse werden in der von Yahoo Finance gemeldeten "
-        "Handelswährung des jeweiligen Tickers angezeigt (siehe Spalte 'Währung'). "
-        "Ticker ohne Börsenkürzel (z. B. 'BMW' statt 'BMW.DE') werden automatisch "
-        "über gängige europäische Börsensuffixe und die Yahoo-Finance-Suche aufgelöst."
+        "den Kurstrend mit dem OBV-Trend, um Trendbestätigungen und Divergenzen zu "
+        "erkennen. Alle Kurse werden einheitlich in Euro angezeigt (Live-Umrechnung "
+        "über aktuelle Wechselkurse - die Ursprungswährung steht zur Transparenz in "
+        "der Spalte 'Ursprüngliche Währung'; da der aktuelle statt des historischen "
+        "Wechselkurses verwendet wird, ist die Umrechnung eine Näherung). Ticker ohne "
+        "Börsenkürzel (z. B. 'BMW' statt 'BMW.DE') sowie WKN oder ISIN für deutsche "
+        "Werte werden automatisch über die Yahoo-Finance-Suche und gängige "
+        "europäische Börsensuffixe aufgelöst."
     )
     st.warning(f"⚠️ {DISCLAIMER_TEXT}")
 
@@ -586,17 +737,21 @@ def main() -> None:
 
     if input_mode == "Manuelle Eingabe":
         manual_text = st.sidebar.text_input(
-            "Ticker (einzeln oder kommagetrennt)",
-            placeholder="z. B. AAPL oder AAPL, MSFT, TSLA",
+            "Ticker, WKN oder ISIN (einzeln oder kommagetrennt)",
+            placeholder="z. B. AAPL oder AAPL, BMW.DE, 716460",
+            help=(
+                "Für deutsche Werte kann statt des Tickers auch die WKN "
+                "(z. B. '716460' für BMW) oder die ISIN eingegeben werden."
+            ),
         )
     else:
         uploaded_file = st.sidebar.file_uploader(
-            "Excel-Datei mit Ticker-Liste (.xlsx / .xls)",
+            "Excel-Datei mit Ticker-/WKN-Liste (.xlsx / .xls)",
             type=["xlsx", "xls"],
             help=(
-                "Es wird automatisch nach einer Spalte 'Ticker', 'Symbol', 'Aktie' "
-                "oder 'Wertpapier' gesucht. Wird keine gefunden, wird die erste "
-                "Spalte der Tabelle verwendet."
+                "Es wird automatisch nach einer Spalte 'Ticker', 'Symbol', 'Aktie', "
+                "'Wertpapier' oder 'WKN' gesucht. Wird keine gefunden, wird die "
+                "erste Spalte der Tabelle verwendet."
             ),
         )
 
@@ -610,8 +765,8 @@ def main() -> None:
 
     # --- Hauptbereich: Analyse & Ausgabe -----------------------------------
     if not start_analysis:
-        st.info("Ticker eingeben bzw. Excel-Datei hochladen, Zeitraum wählen und auf "
-                 "'Analyse starten' klicken.")
+        st.info("Ticker/WKN eingeben bzw. Excel-Datei hochladen, Zeitraum wählen und "
+                 "auf 'Analyse starten' klicken.")
         return
 
     tickers = get_ticker_list(input_mode, manual_text, uploaded_file)
