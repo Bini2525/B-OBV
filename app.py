@@ -6,11 +6,16 @@ Streamlit-App zur automatisierten On-Balance-Volume (OBV) Analyse von Aktien.
 
 Funktionen:
     - Ticker-Eingabe manuell (Textfeld, kommagetrennt) ODER per Excel-Upload
+    - Analyse-Zeitraum wählbar: 1 Woche, 1 Monat, 3 Monate, 6 Monate, 1 Jahr
     - Abruf historischer Kurs-/Volumendaten via yfinance
     - Berechnung des On-Balance-Volume (OBV)
     - Trend- und Divergenzanalyse (Kurs vs. OBV) über die letzten Handelstage
+    - Durchschnittliches Analystenkursziel je Ticker (sofern von Yahoo Finance geführt)
     - Interaktive Ergebnistabelle in der App
     - Download des Ergebnisses als formatierte Excel-Datei (.xlsx)
+
+Hinweis: Diese App dient ausschließlich Informationszwecken und stellt
+keine Anlageberatung dar.
 
 Hosting:
     Kann unverändert über GitHub + Streamlit Community Cloud deployed werden.
@@ -34,12 +39,21 @@ from openpyxl.utils import get_column_letter
 # ---------------------------------------------------------------------------
 
 # Zuordnung der UI-Auswahl auf die von yfinance erwarteten Period-Strings.
+# "1 Woche" wird über "5d" (5 Handelstage) abgebildet, da yfinance keinen
+# eigenen 1-Wochen-Period-String kennt.
 PERIOD_OPTIONS: dict[str, str] = {
+    "1 Woche": "5d",
+    "1 Monat": "1mo",
     "3 Monate": "3mo",
     "6 Monate": "6mo",
     "1 Jahr": "1y",
 }
 DEFAULT_PERIOD_LABEL = "6 Monate"
+
+# Mindestanzahl an Handelstagen, ab der die Trend-/Divergenzanalyse als
+# statistisch belastbar gilt. Bei kürzeren Zeiträumen (z. B. "1 Woche")
+# wird das Ergebnis trotzdem berechnet, aber als eingeschränkt gekennzeichnet.
+MIN_RELIABLE_DAYS = 10
 
 # Anzahl der Handelstage, die für die Trend-/Divergenzanalyse betrachtet werden.
 LOOKBACK_DAYS = 15  # liegt im geforderten Korridor von 10 bis 20 Handelstagen
@@ -52,6 +66,12 @@ TREND_SLOPE_THRESHOLD = 0.001
 
 # Spaltennamen, nach denen beim Excel-Import gesucht wird (case-insensitive).
 TICKER_COLUMN_CANDIDATES = ["ticker", "symbol", "aktie", "wertpapier"]
+
+# Pflicht-Disclaimer für alle Aktien-/Finanzanalyse-Apps.
+DISCLAIMER_TEXT = (
+    "Hinweis: Diese App dient ausschließlich Informationszwecken und stellt "
+    "keine Anlageberatung dar. Keine Kauf- oder Verkaufsempfehlung."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -116,13 +136,14 @@ def get_ticker_list(input_mode: str, manual_text: str, uploaded_file) -> list[st
 # Datenabruf & OBV-Berechnung
 # ---------------------------------------------------------------------------
 
-def fetch_price_history(ticker: str, period: str) -> tuple[pd.DataFrame, str]:
+def fetch_price_history(ticker: str, period: str) -> tuple[pd.DataFrame, dict]:
     """
     Ruft historische Kurs- und Volumendaten für einen Ticker ab.
 
-    Gibt ein DataFrame mit den Spalten 'Close' und 'Volume' sowie die
-    gemeldete Handelswährung zurück. Wirft eine Exception, wenn keine
-    verwertbaren Daten vorliegen (wird vom Aufrufer abgefangen).
+    Gibt ein DataFrame mit den Spalten 'Close' und 'Volume' sowie ein
+    Meta-Dict (Handelswährung, durchschnittliches Analystenkursziel) zurück.
+    Wirft eine Exception, wenn keine verwertbaren Kursdaten vorliegen
+    (wird vom Aufrufer abgefangen).
     """
     ticker_obj = yf.Ticker(ticker)
     hist = ticker_obj.history(period=period, auto_adjust=False)
@@ -137,16 +158,30 @@ def fetch_price_history(ticker: str, period: str) -> tuple[pd.DataFrame, str]:
     if hist.empty:
         raise ValueError(f"Keine verwertbaren Kurs-/Volumendaten für '{ticker}'.")
 
-    # Handelswährung ermitteln (nicht kritisch, daher robust mit Fallback).
-    currency = "n/a"
-    try:
-        fast_info = getattr(ticker_obj, "fast_info", None)
-        if fast_info is not None:
-            currency = fast_info.get("currency") or "n/a"
-    except Exception:
-        currency = "n/a"
+    meta = {"currency": "n/a", "avg_analyst_target": None}
 
-    return hist, currency
+    # Handelswährung & durchschnittliches Analystenkursziel ermitteln.
+    # Beides ist nicht kritisch für die OBV-Analyse selbst (nicht jeder
+    # Ticker hat Analysten-Coverage), daher robust mit Fallback statt Abbruch.
+    try:
+        info = ticker_obj.info
+        if info:
+            meta["currency"] = info.get("currency") or meta["currency"]
+            target = info.get("targetMeanPrice")
+            if target is not None:
+                meta["avg_analyst_target"] = float(target)
+    except Exception:
+        pass
+
+    if meta["currency"] == "n/a":
+        try:
+            fast_info = getattr(ticker_obj, "fast_info", None)
+            if fast_info is not None:
+                meta["currency"] = fast_info.get("currency") or "n/a"
+        except Exception:
+            pass
+
+    return hist, meta
 
 
 def calculate_obv(hist: pd.DataFrame) -> pd.DataFrame:
@@ -222,14 +257,23 @@ def analyze_trend_divergence(df: pd.DataFrame, lookback: int = LOOKBACK_DAYS) ->
     obv_trend = classify_trend(window["OBV"])
 
     if price_trend == "up" and obv_trend == "up":
-        return "Aufwärtstrend bestätigt"
-    if price_trend == "down" and obv_trend == "down":
-        return "Abwärtstrend bestätigt"
-    if price_trend in ("down", "flat") and obv_trend == "up":
-        return "Bullische Divergenz (Kaufsignal)"
-    if price_trend == "up" and obv_trend in ("down", "flat"):
-        return "Bärische Divergenz (Verkaufssignal)"
-    return "Keine klare Richtung"
+        bewertung = "Aufwärtstrend bestätigt"
+    elif price_trend == "down" and obv_trend == "down":
+        bewertung = "Abwärtstrend bestätigt"
+    elif price_trend in ("down", "flat") and obv_trend == "up":
+        bewertung = "Bullische Divergenz (Kaufsignal)"
+    elif price_trend == "up" and obv_trend in ("down", "flat"):
+        bewertung = "Bärische Divergenz (Verkaufssignal)"
+    else:
+        bewertung = "Keine klare Richtung"
+
+    # Bei kurzen Zeiträumen (z. B. "1 Woche") steht weniger als
+    # MIN_RELIABLE_DAYS Handelstage zur Verfügung - Ergebnis wird trotzdem
+    # ausgegeben, aber transparent als weniger belastbar gekennzeichnet.
+    if len(window) < MIN_RELIABLE_DAYS:
+        bewertung += " (eingeschränkte Datenbasis)"
+
+    return bewertung
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +289,7 @@ def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
     und Fehlschlag unterscheiden, ohne die App abstürzen zu lassen.
     """
     try:
-        hist, currency = fetch_price_history(ticker, period)
+        hist, meta = fetch_price_history(ticker, period)
         hist_with_obv = calculate_obv(hist)
 
         if len(hist_with_obv) < 2:
@@ -253,10 +297,13 @@ def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
 
         bewertung = analyze_trend_divergence(hist_with_obv, LOOKBACK_DAYS)
 
+        avg_target = meta.get("avg_analyst_target")
+
         result = {
             "Ticker": ticker,
-            "Währung": currency,
+            "Währung": meta.get("currency", "n/a"),
             "Aktueller Kurs": round(float(hist_with_obv["Close"].iloc[-1]), 2),
+            "Durchschnittliches Analystenkursziel": round(avg_target, 2) if avg_target is not None else None,
             "Letztes Volumen": int(hist_with_obv["Volume"].iloc[-1]),
             "Aktueller OBV-Wert": int(hist_with_obv["OBV"].iloc[-1]),
             "Trend-Bestätigung / Divergenz": bewertung,
@@ -288,6 +335,7 @@ def build_excel_bytes(result_df: pd.DataFrame) -> bytes:
         text_columns = {"Ticker", "Währung", "Trend-Bestätigung / Divergenz"}
         number_format_map = {
             "Aktueller Kurs": "#,##0.00",
+            "Durchschnittliches Analystenkursziel": "#,##0.00",
             "Letztes Volumen": "#,##0",
             "Aktueller OBV-Wert": "#,##0",
         }
@@ -331,6 +379,11 @@ def build_excel_bytes(result_df: pd.DataFrame) -> bytes:
 
         worksheet.freeze_panes = "A2"
 
+        # Disclaimer unterhalb der Tabelle: keine Anlageberatung.
+        disclaimer_row = n_rows + 3
+        worksheet.cell(row=disclaimer_row, column=1, value=DISCLAIMER_TEXT)
+        worksheet.cell(row=disclaimer_row, column=1).font = Font(name="Arial", size=9, italic=True)
+
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -348,6 +401,7 @@ def main() -> None:
         "zu erkennen. Kurse werden in der von Yahoo Finance gemeldeten "
         "Handelswährung des jeweiligen Tickers angezeigt (siehe Spalte 'Währung')."
     )
+    st.warning(f"⚠️ {DISCLAIMER_TEXT}")
 
     # --- Sidebar: Eingabe -------------------------------------------------
     st.sidebar.header("Eingabe")
