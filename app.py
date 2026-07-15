@@ -461,6 +461,22 @@ def build_display_dataframe(result_df: pd.DataFrame) -> pd.DataFrame:
     return display_df
 
 
+def _max_text_length(values, minimum: int = 0) -> int:
+    """
+    Ermittelt die maximale Textlänge einer Spalte, robust gegenüber None/NaN
+    und unabhängig vom pandas-Backend (numpy-object vs. Arrow-backed).
+
+    Hintergrund: `series.astype(str).map(len)` ist NICHT sicher, wenn die
+    Spalte None-Werte enthält - je nach pandas-/pyarrow-Version bleibt der
+    Null-Wert nach astype(str) ein NA-Sentinel statt der Textstring "None"
+    zu werden, wodurch len() mit TypeError abbricht (genau dieser Fehler
+    trat in Produktion bei fehlendem Analystenkursziel auf). Deshalb hier
+    bewusst eine explizite pd.notna()-Prüfung statt astype(str) + map(len).
+    """
+    lengths = [len(str(v)) for v in values if pd.notna(v)]
+    return max(lengths, default=minimum)
+
+
 # ---------------------------------------------------------------------------
 # Excel-Export mit Formatierung
 # ---------------------------------------------------------------------------
@@ -519,12 +535,14 @@ def build_excel_bytes(result_df: pd.DataFrame) -> bytes:
                 if col_name in number_format_map:
                     cell.number_format = number_format_map[col_name]
 
-            # Spaltenbreite: Mindestbreite 13, sonst am längsten Inhalt ausgerichtet,
-            # damit keine "####"-Anzeige entsteht.
-            max_content_len = len(str(col_name))
-            if n_rows > 0:
-                col_values = result_df[col_name].astype(str)
-                max_content_len = max(max_content_len, col_values.map(len).max())
+            # Spaltenbreite: Mindestbreite 13, sonst am längsten Inhalt
+            # ausgerichtet, damit keine "####"-Anzeige entsteht. None/NaN
+            # werden dabei übersprungen statt einen Fehler zu werfen (siehe
+            # _max_text_length).
+            max_content_len = max(
+                len(str(col_name)),
+                _max_text_length(result_df[col_name].tolist()) if n_rows > 0 else 0,
+            )
             worksheet.column_dimensions[col_letter].width = max(13, max_content_len + 2)
 
         worksheet.freeze_panes = "A2"
