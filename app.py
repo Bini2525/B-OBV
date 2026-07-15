@@ -6,12 +6,14 @@ Streamlit-App zur automatisierten On-Balance-Volume (OBV) Analyse von Aktien.
 
 Funktionen:
     - Ticker-Eingabe manuell (Textfeld, kommagetrennt) ODER per Excel-Upload
+    - Automatische Auflösung europäischer Ticker ohne Börsen-Suffix
+      (z. B. "BMW" -> "BMW.DE") über Suffix-Heuristik + Yahoo-Finance-Suche
     - Analyse-Zeitraum wählbar: 1 Woche, 1 Monat, 3 Monate, 6 Monate, 1 Jahr
     - Abruf historischer Kurs-/Volumendaten via yfinance
     - Berechnung des On-Balance-Volume (OBV)
     - Trend- und Divergenzanalyse (Kurs vs. OBV) über die letzten Handelstage
     - Durchschnittliches Analystenkursziel je Ticker (sofern von Yahoo Finance geführt)
-    - Interaktive Ergebnistabelle in der App
+    - Interaktive Ergebnistabelle in der App (deutsches Zahlenformat)
     - Download des Ergebnisses als formatierte Excel-Datei (.xlsx)
 
 Hinweis: Diese App dient ausschließlich Informationszwecken und stellt
@@ -73,6 +75,22 @@ DISCLAIMER_TEXT = (
     "keine Anlageberatung dar. Keine Kauf- oder Verkaufsempfehlung."
 )
 
+# Gängige Börsen-Suffixe für Yahoo Finance, nach denen gesucht wird, wenn ein
+# roher Ticker (z. B. "BMW" statt "BMW.DE") nicht direkt gefunden wird.
+# Schwerpunkt DACH/Westeuropa, da für europäische Broker-Exports typisch.
+EXCHANGE_SUFFIXES = [
+    ".DE",  # Xetra (Deutschland)
+    ".F",   # Frankfurt (Alternative zu Xetra)
+    ".SW",  # SIX Swiss Exchange
+    ".L",   # London Stock Exchange
+    ".AS",  # Euronext Amsterdam
+    ".PA",  # Euronext Paris
+    ".MI",  # Borsa Italiana Mailand
+    ".MC",  # Bolsa de Madrid
+    ".BR",  # Euronext Brüssel
+    ".VI",  # Wiener Börse
+]
+
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen: Ticker-Eingabe (manuell & Excel-Upload)
@@ -133,36 +151,112 @@ def get_ticker_list(input_mode: str, manual_text: str, uploaded_file) -> list[st
 
 
 # ---------------------------------------------------------------------------
-# Datenabruf & OBV-Berechnung
+# Ticker-Auflösung (Börsen-Suffix-Heuristik + Yahoo-Suche) & Datenabruf
 # ---------------------------------------------------------------------------
+
+def _try_symbol(symbol: str, period: str):
+    """
+    Versucht, für ein konkretes Yahoo-Finance-Symbol Kursdaten zu laden.
+
+    Gibt (ticker_obj, hist) zurück, wenn verwertbare Daten vorliegen,
+    sonst None. Wirft absichtlich keine Exception - wird als "Testballon"
+    innerhalb der Auflösungs-Kette verwendet.
+    """
+    try:
+        ticker_obj = yf.Ticker(symbol)
+        hist = ticker_obj.history(period=period, auto_adjust=False)
+        if hist is None or hist.empty:
+            return None
+        if "Close" not in hist.columns or "Volume" not in hist.columns:
+            return None
+        hist = hist[["Close", "Volume"]].dropna()
+        if hist.empty:
+            return None
+        return ticker_obj, hist
+    except Exception:
+        return None
+
+
+def resolve_ticker(raw_ticker: str, period: str) -> tuple[str, "yf.Ticker", pd.DataFrame]:
+    """
+    Löst einen rohen Ticker-Code in ein gültiges Yahoo-Finance-Symbol auf und
+    lädt dabei direkt die passende Kurshistorie.
+
+    Viele europäische Broker-Exports (z. B. Trade Republic, comdirect) führen
+    Aktien ohne Börsen-Suffix (z. B. "BMW" statt "BMW.DE"). Yahoo Finance
+    benötigt für Nicht-US-Börsen aber i. d. R. ein Suffix. Auflösungs-Reihenfolge:
+
+        1. Ticker wie eingegeben probieren (deckt US-Ticker sowie bereits
+           korrekt angegebene Symbole wie "BMW.DE" ab).
+        2. Yahoo-Finance-Volltextsuche (yfinance.Search) - findet in der
+           Praxis meist direkt das richtige Symbol samt Börsenplatz.
+        3. Als letzter Fallback: gängige europäische Börsensuffixe (siehe
+           EXCHANGE_SUFFIXES) systematisch durchprobieren.
+
+    Gibt (aufgelöstes_symbol, ticker_obj, hist) zurück oder wirft eine
+    ValueError, wenn keiner der drei Wege zu verwertbaren Daten führt.
+    """
+    # 1) Roher Ticker wie eingegeben.
+    found = _try_symbol(raw_ticker, period)
+    if found is not None:
+        return raw_ticker, found[0], found[1]
+
+    # 2) Yahoo-Finance-Suche (liefert i. d. R. bereits das korrekte,
+    #    börsenspezifische Symbol als Top-Treffer).
+    try:
+        search_results = yf.Search(raw_ticker, max_results=5).quotes
+    except Exception:
+        search_results = []
+
+    for quote in search_results:
+        symbol = quote.get("symbol")
+        if not symbol:
+            continue
+        found = _try_symbol(symbol, period)
+        if found is not None:
+            return symbol, found[0], found[1]
+
+    # 3) Suffix-Heuristik als letzter Fallback (nur wenn kein Suffix bereits
+    #    im Ticker enthalten ist - sonst würden unsinnige Kombinationen wie
+    #    "BMW.DE.SW" entstehen).
+    if "." not in raw_ticker:
+        for suffix in EXCHANGE_SUFFIXES:
+            candidate = f"{raw_ticker}{suffix}"
+            found = _try_symbol(candidate, period)
+            if found is not None:
+                return candidate, found[0], found[1]
+
+    raise ValueError(
+        f"Kein gültiges Yahoo-Finance-Symbol für '{raw_ticker}' gefunden - "
+        f"auch nicht über die Yahoo-Suche oder gängige Börsensuffixe "
+        f"(.DE/.SW/.L/...). Ticker ggf. mit explizitem Börsenkürzel angeben, "
+        f"z. B. '{raw_ticker}.DE'."
+    )
+
 
 def fetch_price_history(ticker: str, period: str) -> tuple[pd.DataFrame, dict]:
     """
-    Ruft historische Kurs- und Volumendaten für einen Ticker ab.
+    Ruft historische Kurs- und Volumendaten für einen Ticker ab (inkl.
+    automatischer Ticker-Auflösung, siehe resolve_ticker).
 
     Gibt ein DataFrame mit den Spalten 'Close' und 'Volume' sowie ein
-    Meta-Dict (Handelswährung, durchschnittliches Analystenkursziel) zurück.
-    Wirft eine Exception, wenn keine verwertbaren Kursdaten vorliegen
-    (wird vom Aufrufer abgefangen).
+    Meta-Dict (Name, Handelswährung, durchschnittliches Analystenkursziel,
+    aufgelöstes Yahoo-Symbol) zurück. Wirft eine Exception, wenn keine
+    verwertbaren Daten vorliegen (wird vom Aufrufer abgefangen).
     """
-    ticker_obj = yf.Ticker(ticker)
-    hist = ticker_obj.history(period=period, auto_adjust=False)
+    resolved_symbol, ticker_obj, hist = resolve_ticker(ticker, period)
 
-    if hist is None or hist.empty:
-        raise ValueError(f"Keine Kursdaten für '{ticker}' gefunden.")
+    meta = {
+        "currency": "n/a",
+        "avg_analyst_target": None,
+        "name": resolved_symbol,
+        "resolved_symbol": resolved_symbol,
+    }
 
-    if "Close" not in hist.columns or "Volume" not in hist.columns:
-        raise ValueError(f"Unvollständige Daten für '{ticker}' (Close/Volume fehlt).")
-
-    hist = hist[["Close", "Volume"]].dropna()
-    if hist.empty:
-        raise ValueError(f"Keine verwertbaren Kurs-/Volumendaten für '{ticker}'.")
-
-    meta = {"currency": "n/a", "avg_analyst_target": None}
-
-    # Handelswährung & durchschnittliches Analystenkursziel ermitteln.
-    # Beides ist nicht kritisch für die OBV-Analyse selbst (nicht jeder
-    # Ticker hat Analysten-Coverage), daher robust mit Fallback statt Abbruch.
+    # Firmenname, Handelswährung & durchschnittliches Analystenkursziel
+    # ermitteln. Alles nicht kritisch für die OBV-Analyse selbst (nicht jeder
+    # Ticker hat z. B. Analysten-Coverage), daher robust mit Fallback statt
+    # Abbruch.
     try:
         info = ticker_obj.info
         if info:
@@ -170,6 +264,9 @@ def fetch_price_history(ticker: str, period: str) -> tuple[pd.DataFrame, dict]:
             target = info.get("targetMeanPrice")
             if target is not None:
                 meta["avg_analyst_target"] = float(target)
+            name = info.get("longName") or info.get("shortName")
+            if name:
+                meta["name"] = name
     except Exception:
         pass
 
@@ -301,6 +398,7 @@ def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
 
         result = {
             "Ticker": ticker,
+            "Name": meta.get("name") or ticker,
             "Währung": meta.get("currency", "n/a"),
             "Aktueller Kurs": round(float(hist_with_obv["Close"].iloc[-1]), 2),
             "Durchschnittliches Analystenkursziel": round(avg_target, 2) if avg_target is not None else None,
@@ -312,6 +410,55 @@ def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
 
     except Exception as exc:  # noqa: BLE001 - bewusst breit, damit kein Ticker die App killt
         return None, f"{ticker}: Analyse fehlgeschlagen ({exc})."
+
+
+# ---------------------------------------------------------------------------
+# Deutsches Zahlenformat für die Bildschirmanzeige
+# ---------------------------------------------------------------------------
+
+def format_de_number(value, decimals: int = 2) -> str:
+    """
+    Formatiert eine Zahl im deutschen Format (Tausenderpunkt, Komma als
+    Dezimaltrennzeichen), z. B. 1234.5 -> "1.234,50".
+
+    Gibt einen leeren String zurück, wenn kein Wert vorhanden ist
+    (None/NaN) - relevant z. B. für fehlendes Analystenkursziel.
+    """
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, float) and np.isnan(value):
+            return ""
+    except TypeError:
+        pass
+
+    # Trick: zunächst im US-Format formatieren (Komma=Tausender, Punkt=Dezimal),
+    # anschließend Trennzeichen tauschen -> deutsches Format.
+    us_formatted = f"{value:,.{decimals}f}"
+    return us_formatted.replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def build_display_dataframe(result_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Erstellt eine Anzeige-Kopie des Ergebnis-DataFrames mit Zahlen im
+    deutschen Format - ausschließlich für die Bildschirmanzeige in
+    st.dataframe(). Der Excel-Export (build_excel_bytes) arbeitet weiterhin
+    mit den numerischen Rohwerten aus result_df, damit Excel eigene
+    Zahlenformate korrekt anwenden kann.
+    """
+    display_df = result_df.copy()
+
+    two_decimal_cols = ["Aktueller Kurs", "Durchschnittliches Analystenkursziel"]
+    zero_decimal_cols = ["Letztes Volumen", "Aktueller OBV-Wert"]
+
+    for col in two_decimal_cols:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(lambda v: format_de_number(v, 2))
+    for col in zero_decimal_cols:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(lambda v: format_de_number(v, 0))
+
+    return display_df
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +479,10 @@ def build_excel_bytes(result_df: pd.DataFrame) -> bytes:
         thin_black = Side(border_style="thin", color="000000")
         table_border = Border(left=thin_black, right=thin_black, top=thin_black, bottom=thin_black)
 
-        text_columns = {"Ticker", "Währung", "Trend-Bestätigung / Divergenz"}
+        # Textspalten: linksbündig. Alle übrigen Spalten (Zahlen) rechtsbündig,
+        # 2 Nachkommastellen + Tausenderpunkt bzw. 0 Nachkommastellen gemäß
+        # globalem Zahlenformat-Standard.
+        text_columns = {"Ticker", "Name", "Währung", "Trend-Bestätigung / Divergenz"}
         number_format_map = {
             "Aktueller Kurs": "#,##0.00",
             "Durchschnittliches Analystenkursziel": "#,##0.00",
@@ -399,7 +549,9 @@ def main() -> None:
         "Berechnet das On-Balance-Volume (OBV) für beliebige Aktien und vergleicht "
         "den Kurstrend mit dem OBV-Trend, um Trendbestätigungen und Divergenzen "
         "zu erkennen. Kurse werden in der von Yahoo Finance gemeldeten "
-        "Handelswährung des jeweiligen Tickers angezeigt (siehe Spalte 'Währung')."
+        "Handelswährung des jeweiligen Tickers angezeigt (siehe Spalte 'Währung'). "
+        "Ticker ohne Börsenkürzel (z. B. 'BMW' statt 'BMW.DE') werden automatisch "
+        "über gängige europäische Börsensuffixe und die Yahoo-Finance-Suche aufgelöst."
     )
     st.warning(f"⚠️ {DISCLAIMER_TEXT}")
 
@@ -482,7 +634,7 @@ def main() -> None:
     result_df = pd.DataFrame(results)
 
     st.subheader("Ergebnis")
-    st.dataframe(result_df, use_container_width=True, hide_index=True)
+    st.dataframe(build_display_dataframe(result_df), use_container_width=True, hide_index=True)
 
     # --- Excel-Export -------------------------------------------------------
     excel_bytes = build_excel_bytes(result_df)
