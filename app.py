@@ -109,16 +109,14 @@ PENCE_CURRENCIES = {"GBp", "GBX"}
 # nicht pro Ticker erneut derselbe FX-Kurs abgerufen werden muss.
 _FX_RATE_CACHE: dict[str, float | None] = {}
 
-# Finale Spaltenreihenfolge für Anzeige & Excel-Export: zuerst Aktienname,
-# dann Trend-Bestätigung/Divergenz, dann Differenz zum Analystenkursziel -
-# das sind die drei Spalten, die für die schnelle Einschätzung am wichtigsten
-# sind. Alle übrigen (eher nachrangigen) Spalten folgen danach.
+# Finale Spaltenreihenfolge für Anzeige & Excel-Export, exakt nach Helens
+# Vorgabe: Aktienname, Trendbestätigung, über/unter Kursziel, Kurs,
+# Analystenkursziel, KGV aktuell, KGV erwartet, PEG, Fibonacci-Level. Die
+# übrigen (eher nachrangigen) Spalten folgen danach.
 COLUMN_ORDER = [
     "Name",
     "Trend-Bestätigung / Divergenz",
     "Kurs über oder unter Analystenziel",
-    "Ticker",
-    "Ursprüngliche Währung",
     "Aktueller Kurs (EUR)",
     "Durchschnittliches Analystenkursziel (EUR)",
     "KGV (aktuell)",
@@ -128,6 +126,8 @@ COLUMN_ORDER = [
     "Fibonacci 38,2 % (EUR)",
     "Fibonacci 50,0 % (EUR)",
     "Fibonacci 61,8 % (EUR)",
+    "Ticker",
+    "Ursprüngliche Währung",
     "Letztes Volumen",
     "Aktueller OBV-Wert",
 ]
@@ -144,9 +144,9 @@ TREND_SORT_ORDER = {
 TREND_SORT_FALLBACK = len(TREND_SORT_ORDER)  # z. B. für "Keine klare Richtung"
 
 # Fibonacci-Retracement-Level (klassische, in der technischen Analyse
-# gebräuchlichste Auswahl) und die zugehörigen Spaltennamen. Berechnung
-# erfolgt zwischen Tief (0 %) und Hoch (100 %) des gewählten Analyse-
-# Zeitraums, siehe compute_fibonacci_levels().
+# gebräuchlichste Auswahl) und die zugehörigen Spaltennamen. Berechnung als
+# Retracement zum Wiedereinstieg (Hoch = 0 %, Tief = 100 % des gewählten
+# Analyse-Zeitraums), siehe compute_fibonacci_levels().
 FIBONACCI_RATIOS: dict[str, float] = {
     "Fibonacci 23,6 % (EUR)": 0.236,
     "Fibonacci 38,2 % (EUR)": 0.382,
@@ -627,13 +627,16 @@ def compare_price_to_target(current_price: float | None, avg_target: float | Non
 def compute_fibonacci_levels(period_low: float | None, period_high: float | None) -> dict[str, float | None]:
     """
     Berechnet die klassischen Fibonacci-Retracement-Level (23,6 % / 38,2 % /
-    50,0 % / 61,8 %) zwischen dem Tief (0 %) und Hoch (100 %) des gewählten
+    50,0 % / 61,8 %) zwischen dem Hoch (0 %) und Tief (100 %) des gewählten
     Analyse-Zeitraums (beide Werte bereits in Euro umgerechnet).
 
-    Konvention: Tief = 0 %-Anker, Hoch = 100 %-Anker, Level-Preis = Tief +
-    (Hoch - Tief) * Ratio. Das entspricht der gängigen Lesart als mögliche
-    Unterstützungszonen bei einem Rücksetzer innerhalb der Handelsspanne des
-    Zeitraums (unabhängig von der konkreten Trendrichtung).
+    Konvention "Retracement zum Wiedereinstieg" (Standard in Trading-
+    Plattformen wie TradingView, wenn die Linie von einem Tief zu einem Hoch
+    gezogen wird): Hoch = 0 %-Anker, Tief = 100 %-Anker, Level-Preis = Hoch -
+    (Hoch - Tief) * Ratio. Die Level liegen damit als potenzielle
+    Unterstützungs-/Wiedereinstiegszonen UNTERHALB des Zwischenhochs - je
+    größer die Ratio, desto tiefer der mögliche Rücksetzer, bevor der
+    Aufwärtstrend fortgesetzt werden könnte.
 
     Gibt ein Dict mit den in FIBONACCI_RATIOS definierten Spaltennamen zurück.
     Liefert für alle Level None, wenn Tief oder Hoch fehlen (z. B. weil die
@@ -644,7 +647,7 @@ def compute_fibonacci_levels(period_low: float | None, period_high: float | None
 
     span = period_high - period_low
     return {
-        name: round(period_low + span * ratio, 2)
+        name: round(period_high - span * ratio, 2)
         for name, ratio in FIBONACCI_RATIOS.items()
     }
 
@@ -929,8 +932,9 @@ def main() -> None:
         "Börsenkürzel (z. B. 'BMW' statt 'BMW.DE') sowie WKN oder ISIN für deutsche "
         "Werte werden automatisch über die Yahoo-Finance-Suche und gängige "
         "europäische Börsensuffixe aufgelöst. Zusätzlich werden KGV (aktuell "
-        "und erwartet), PEG-Ratio sowie Fibonacci-Retracement-Level (23,6/"
-        "38,2/50,0/61,8 %, berechnet aus Hoch/Tief des Analyse-Zeitraums) "
+        "und erwartet), PEG-Ratio sowie Fibonacci-Retracement-Level zum "
+        "Wiedereinstieg (23,6/38,2/50,0/61,8 %, gerechnet vom Hoch abwärts "
+        "zum Tief des Analyse-Zeitraums als mögliche Unterstützungszonen) "
         "ausgegeben; nicht jeder Ticker verfügt über alle Kennzahlen (z. B. "
         "kein KGV bei negativem Gewinn) - fehlende Werte bleiben leer."
     )
