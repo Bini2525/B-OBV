@@ -15,6 +15,10 @@ Funktionen:
     - Trend- und Divergenzanalyse (Kurs vs. OBV) über die letzten Handelstage
     - Durchschnittliches Analystenkursziel je Ticker (sofern von Yahoo Finance geführt)
     - Vergleich aktueller Kurs vs. Analystenkursziel (Über-/Unterbewertung in %)
+    - KGV aktuell (trailing P/E) und KGV erwartet (forward P/E)
+    - PEG-Ratio (KGV im Verhältnis zum erwarteten Gewinnwachstum)
+    - Fibonacci-Retracement-Level (23,6/38,2/50,0/61,8 %) auf Basis von
+      Hoch/Tief des gewählten Analyse-Zeitraums
     - Alle Kurse einheitlich in Euro (Live-Umrechnung über Yahoo-FX-Kurse)
     - Interaktive Ergebnistabelle in der App (deutsches Zahlenformat)
     - Download des Ergebnisses als formatierte Excel-Datei (.xlsx)
@@ -117,6 +121,13 @@ COLUMN_ORDER = [
     "Ursprüngliche Währung",
     "Aktueller Kurs (EUR)",
     "Durchschnittliches Analystenkursziel (EUR)",
+    "KGV (aktuell)",
+    "KGV (erwartet)",
+    "PEG-Ratio",
+    "Fibonacci 23,6 % (EUR)",
+    "Fibonacci 38,2 % (EUR)",
+    "Fibonacci 50,0 % (EUR)",
+    "Fibonacci 61,8 % (EUR)",
     "Letztes Volumen",
     "Aktueller OBV-Wert",
 ]
@@ -131,6 +142,17 @@ TREND_SORT_ORDER = {
     "Bärische Divergenz (Verkaufssignal)": 3,
 }
 TREND_SORT_FALLBACK = len(TREND_SORT_ORDER)  # z. B. für "Keine klare Richtung"
+
+# Fibonacci-Retracement-Level (klassische, in der technischen Analyse
+# gebräuchlichste Auswahl) und die zugehörigen Spaltennamen. Berechnung
+# erfolgt zwischen Tief (0 %) und Hoch (100 %) des gewählten Analyse-
+# Zeitraums, siehe compute_fibonacci_levels().
+FIBONACCI_RATIOS: dict[str, float] = {
+    "Fibonacci 23,6 % (EUR)": 0.236,
+    "Fibonacci 38,2 % (EUR)": 0.382,
+    "Fibonacci 50,0 % (EUR)": 0.5,
+    "Fibonacci 61,8 % (EUR)": 0.618,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +230,12 @@ def _try_symbol(symbol: str, period: str):
         hist = ticker_obj.history(period=period, auto_adjust=False)
         if hist is None or hist.empty:
             return None
-        if "Close" not in hist.columns or "Volume" not in hist.columns:
+        required_columns = {"Close", "High", "Low", "Volume"}
+        if not required_columns.issubset(hist.columns):
             return None
-        hist = hist[["Close", "Volume"]].dropna()
+        # "High"/"Low" werden für die Fibonacci-Retracement-Berechnung
+        # benötigt (siehe compute_fibonacci_levels).
+        hist = hist[["Close", "High", "Low", "Volume"]].dropna()
         if hist.empty:
             return None
         return ticker_obj, hist
@@ -378,12 +403,16 @@ def fetch_price_history(ticker: str, period: str) -> tuple[pd.DataFrame, dict]:
         "avg_analyst_target": None,
         "name": resolved_symbol,
         "resolved_symbol": resolved_symbol,
+        "trailing_pe": None,
+        "forward_pe": None,
+        "peg_ratio": None,
     }
 
-    # Firmenname, Handelswährung & durchschnittliches Analystenkursziel
-    # ermitteln. Alles nicht kritisch für die OBV-Analyse selbst (nicht jeder
-    # Ticker hat z. B. Analysten-Coverage), daher robust mit Fallback statt
-    # Abbruch.
+    # Firmenname, Handelswährung, durchschnittliches Analystenkursziel sowie
+    # KGV (aktuell/erwartet) und PEG-Ratio ermitteln. Alles nicht kritisch
+    # für die OBV-Analyse selbst (nicht jeder Ticker hat z. B. Analysten-
+    # Coverage oder ein sinnvolles KGV bei negativem Gewinn), daher robust
+    # mit Fallback statt Abbruch.
     try:
         info = ticker_obj.info
         if info:
@@ -394,6 +423,26 @@ def fetch_price_history(ticker: str, period: str) -> tuple[pd.DataFrame, dict]:
             name = info.get("longName") or info.get("shortName")
             if name:
                 meta["name"] = name
+
+            # KGV (aktuell) = trailing P/E, bezogen auf die tatsächlichen
+            # Gewinne der letzten 12 Monate.
+            trailing_pe = info.get("trailingPE")
+            if trailing_pe is not None:
+                meta["trailing_pe"] = float(trailing_pe)
+
+            # KGV (erwartet) = forward P/E, bezogen auf den von Analysten
+            # geschätzten Gewinn der nächsten 12 Monate.
+            forward_pe = info.get("forwardPE")
+            if forward_pe is not None:
+                meta["forward_pe"] = float(forward_pe)
+
+            # PEG-Ratio: Yahoo liefert das Feld je nach Ticker/API-Version
+            # unter "pegRatio" oder "trailingPegRatio" - beide abklappern.
+            peg_ratio = info.get("pegRatio")
+            if peg_ratio is None:
+                peg_ratio = info.get("trailingPegRatio")
+            if peg_ratio is not None:
+                meta["peg_ratio"] = float(peg_ratio)
     except Exception:
         pass
 
@@ -575,6 +624,31 @@ def compare_price_to_target(current_price: float | None, avg_target: float | Non
     return "genau auf Kursziel"
 
 
+def compute_fibonacci_levels(period_low: float | None, period_high: float | None) -> dict[str, float | None]:
+    """
+    Berechnet die klassischen Fibonacci-Retracement-Level (23,6 % / 38,2 % /
+    50,0 % / 61,8 %) zwischen dem Tief (0 %) und Hoch (100 %) des gewählten
+    Analyse-Zeitraums (beide Werte bereits in Euro umgerechnet).
+
+    Konvention: Tief = 0 %-Anker, Hoch = 100 %-Anker, Level-Preis = Tief +
+    (Hoch - Tief) * Ratio. Das entspricht der gängigen Lesart als mögliche
+    Unterstützungszonen bei einem Rücksetzer innerhalb der Handelsspanne des
+    Zeitraums (unabhängig von der konkreten Trendrichtung).
+
+    Gibt ein Dict mit den in FIBONACCI_RATIOS definierten Spaltennamen zurück.
+    Liefert für alle Level None, wenn Tief oder Hoch fehlen (z. B. weil die
+    EUR-Umrechnung ausnahmsweise nicht möglich war).
+    """
+    if period_low is None or period_high is None:
+        return {name: None for name in FIBONACCI_RATIOS}
+
+    span = period_high - period_low
+    return {
+        name: round(period_low + span * ratio, 2)
+        for name, ratio in FIBONACCI_RATIOS.items()
+    }
+
+
 def trend_sort_key(bewertung: str) -> int:
     """
     Ordnet einen Trend-/Divergenz-Text seiner Sortierposition gemäß
@@ -614,6 +688,8 @@ def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
         native_currency = meta.get("currency", "n/a")
         native_price = float(hist_with_obv["Close"].iloc[-1])
         native_target = meta.get("avg_analyst_target")
+        native_high = float(hist_with_obv["High"].max())
+        native_low = float(hist_with_obv["Low"].min())
 
         # Alle Kurse einheitlich in Euro anzeigen (Live-Wechselkurs). Falls
         # die Umrechnung ausnahmsweise nicht möglich ist (z. B. FX-Paar bei
@@ -624,6 +700,14 @@ def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
             eur_price = round(native_price, 2)
         eur_target = convert_to_eur(native_target, native_currency) if native_target is not None else None
 
+        eur_high = convert_to_eur(native_high, native_currency)
+        if eur_high is None:
+            eur_high = round(native_high, 2)
+        eur_low = convert_to_eur(native_low, native_currency)
+        if eur_low is None:
+            eur_low = round(native_low, 2)
+        fibonacci_levels = compute_fibonacci_levels(eur_low, eur_high)
+
         result = {
             "Ticker": ticker,
             "Name": meta.get("name") or ticker,
@@ -631,6 +715,10 @@ def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
             "Aktueller Kurs (EUR)": eur_price,
             "Durchschnittliches Analystenkursziel (EUR)": eur_target,
             "Kurs über oder unter Analystenziel": compare_price_to_target(eur_price, eur_target),
+            "KGV (aktuell)": meta.get("trailing_pe"),
+            "KGV (erwartet)": meta.get("forward_pe"),
+            "PEG-Ratio": meta.get("peg_ratio"),
+            **fibonacci_levels,
             "Letztes Volumen": int(hist_with_obv["Volume"].iloc[-1]),
             "Aktueller OBV-Wert": int(hist_with_obv["OBV"].iloc[-1]),
             "Trend-Bestätigung / Divergenz": bewertung,
@@ -693,7 +781,17 @@ def build_display_dataframe(result_df: pd.DataFrame) -> pd.DataFrame:
     """
     display_df = result_df.copy()
 
-    two_decimal_cols = ["Aktueller Kurs (EUR)", "Durchschnittliches Analystenkursziel (EUR)"]
+    two_decimal_cols = [
+        "Aktueller Kurs (EUR)",
+        "Durchschnittliches Analystenkursziel (EUR)",
+        "KGV (aktuell)",
+        "KGV (erwartet)",
+        "PEG-Ratio",
+        "Fibonacci 23,6 % (EUR)",
+        "Fibonacci 38,2 % (EUR)",
+        "Fibonacci 50,0 % (EUR)",
+        "Fibonacci 61,8 % (EUR)",
+    ]
     zero_decimal_cols = ["Letztes Volumen", "Aktueller OBV-Wert"]
 
     for col in two_decimal_cols:
@@ -753,6 +851,13 @@ def build_excel_bytes(result_df: pd.DataFrame) -> bytes:
         number_format_map = {
             "Aktueller Kurs (EUR)": "#,##0.00",
             "Durchschnittliches Analystenkursziel (EUR)": "#,##0.00",
+            "KGV (aktuell)": "#,##0.00",
+            "KGV (erwartet)": "#,##0.00",
+            "PEG-Ratio": "#,##0.00",
+            "Fibonacci 23,6 % (EUR)": "#,##0.00",
+            "Fibonacci 38,2 % (EUR)": "#,##0.00",
+            "Fibonacci 50,0 % (EUR)": "#,##0.00",
+            "Fibonacci 61,8 % (EUR)": "#,##0.00",
             "Letztes Volumen": "#,##0",
             "Aktueller OBV-Wert": "#,##0",
         }
@@ -823,7 +928,11 @@ def main() -> None:
         "Wechselkurses verwendet wird, ist die Umrechnung eine Näherung). Ticker ohne "
         "Börsenkürzel (z. B. 'BMW' statt 'BMW.DE') sowie WKN oder ISIN für deutsche "
         "Werte werden automatisch über die Yahoo-Finance-Suche und gängige "
-        "europäische Börsensuffixe aufgelöst."
+        "europäische Börsensuffixe aufgelöst. Zusätzlich werden KGV (aktuell "
+        "und erwartet), PEG-Ratio sowie Fibonacci-Retracement-Level (23,6/"
+        "38,2/50,0/61,8 %, berechnet aus Hoch/Tief des Analyse-Zeitraums) "
+        "ausgegeben; nicht jeder Ticker verfügt über alle Kennzahlen (z. B. "
+        "kein KGV bei negativem Gewinn) - fehlende Werte bleiben leer."
     )
     st.warning(f"⚠️ {DISCLAIMER_TEXT}")
 
