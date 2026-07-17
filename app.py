@@ -105,6 +105,33 @@ PENCE_CURRENCIES = {"GBp", "GBX"}
 # nicht pro Ticker erneut derselbe FX-Kurs abgerufen werden muss.
 _FX_RATE_CACHE: dict[str, float | None] = {}
 
+# Finale Spaltenreihenfolge für Anzeige & Excel-Export: zuerst Aktienname,
+# dann Trend-Bestätigung/Divergenz, dann Differenz zum Analystenkursziel -
+# das sind die drei Spalten, die für die schnelle Einschätzung am wichtigsten
+# sind. Alle übrigen (eher nachrangigen) Spalten folgen danach.
+COLUMN_ORDER = [
+    "Name",
+    "Trend-Bestätigung / Divergenz",
+    "Kurs über oder unter Analystenziel",
+    "Ticker",
+    "Ursprüngliche Währung",
+    "Aktueller Kurs (EUR)",
+    "Durchschnittliches Analystenkursziel (EUR)",
+    "Letztes Volumen",
+    "Aktueller OBV-Wert",
+]
+
+# Sortierreihenfolge der Trend-/Divergenz-Kategorien für die Ausgabe (primäres
+# Sortierkriterium). "Keine klare Richtung" ist absichtlich nicht enthalten
+# und landet über den Fallback-Wert TREND_SORT_FALLBACK am Ende der Liste.
+TREND_SORT_ORDER = {
+    "Aufwärtstrend bestätigt": 0,
+    "Bullische Divergenz (Kaufsignal)": 1,
+    "Abwärtstrend bestätigt": 2,
+    "Bärische Divergenz (Verkaufssignal)": 3,
+}
+TREND_SORT_FALLBACK = len(TREND_SORT_ORDER)  # z. B. für "Keine klare Richtung"
+
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen: Ticker-Eingabe (manuell & Excel-Upload)
@@ -503,6 +530,25 @@ def format_de_number(value, decimals: int = 2) -> str:
 # Vergleich: aktueller Kurs vs. durchschnittliches Analystenkursziel
 # ---------------------------------------------------------------------------
 
+def compute_diff_pct(current_price: float | None, avg_target: float | None) -> float | None:
+    """
+    Berechnet die vorzeichenbehaftete prozentuale Abweichung des aktuellen
+    Kurses vom durchschnittlichen Analystenkursziel: negativ = Kurs liegt
+    UNTER dem Kursziel (potenzielles Aufwärtspotenzial), positiv = Kurs
+    liegt ÜBER dem Kursziel.
+
+    Wird sowohl für den Anzeigetext (compare_price_to_target) als auch für
+    die Sortierung der Ergebnistabelle (siehe main()) verwendet, damit beide
+    Stellen garantiert denselben Wert zugrunde legen.
+
+    Gibt None zurück, wenn keine Berechnung möglich ist (fehlender Kurs,
+    fehlendes Kursziel oder Kursziel = 0).
+    """
+    if current_price is None or avg_target is None or avg_target == 0:
+        return None
+    return (current_price - avg_target) / avg_target * 100
+
+
 def compare_price_to_target(current_price: float | None, avg_target: float | None) -> str:
     """
     Vergleicht den aktuellen Kurs mit dem durchschnittlichen Analystenkursziel
@@ -516,10 +562,10 @@ def compare_price_to_target(current_price: float | None, avg_target: float | Non
     interpretieren "n/a" oft automatisch als fehlenden Wert (NaN) statt als
     Text.
     """
-    if current_price is None or avg_target is None or avg_target == 0:
+    diff_pct = compute_diff_pct(current_price, avg_target)
+    if diff_pct is None:
         return "keine Analysten-Coverage"
 
-    diff_pct = (current_price - avg_target) / avg_target * 100
     diff_pct_str = format_de_number(abs(diff_pct), 2)
 
     if diff_pct > 0.005:
@@ -527,6 +573,21 @@ def compare_price_to_target(current_price: float | None, avg_target: float | Non
     if diff_pct < -0.005:
         return f"{diff_pct_str} % unter Kursziel"
     return "genau auf Kursziel"
+
+
+def trend_sort_key(bewertung: str) -> int:
+    """
+    Ordnet einen Trend-/Divergenz-Text seiner Sortierposition gemäß
+    TREND_SORT_ORDER zu (Reihenfolge: Aufwärtstrend bestätigt, Bullische
+    Divergenz, Abwärtstrend bestätigt, Bärische Divergenz).
+
+    Der Zusatz " (eingeschränkte Datenbasis)" (siehe analyze_trend_divergence)
+    wird vor dem Abgleich entfernt, damit auch eingeschränkt belastbare
+    Ergebnisse korrekt einsortiert werden. Alles andere (z. B. "Keine klare
+    Richtung") landet über TREND_SORT_FALLBACK am Ende.
+    """
+    base = bewertung.replace(" (eingeschränkte Datenbasis)", "")
+    return TREND_SORT_ORDER.get(base, TREND_SORT_FALLBACK)
 
 
 # ---------------------------------------------------------------------------
@@ -573,11 +634,53 @@ def analyze_ticker(ticker: str, period: str) -> tuple[dict | None, str | None]:
             "Letztes Volumen": int(hist_with_obv["Volume"].iloc[-1]),
             "Aktueller OBV-Wert": int(hist_with_obv["OBV"].iloc[-1]),
             "Trend-Bestätigung / Divergenz": bewertung,
+            # Interne Sortier-Hilfsspalten (werden vor Anzeige/Export wieder
+            # entfernt, siehe sort_result_dataframe in main()):
+            "_trend_sort": trend_sort_key(bewertung),
+            "_diff_pct_sort": compute_diff_pct(eur_price, eur_target),
         }
         return result, None
 
     except Exception as exc:  # noqa: BLE001 - bewusst breit, damit kein Ticker die App killt
         return None, f"{ticker}: Analyse fehlgeschlagen ({exc})."
+
+
+def sort_and_order_results(result_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sortiert die Ergebniszeilen und bringt die Spalten in die gewünschte
+    Endreihenfolge (COLUMN_ORDER).
+
+    Sortierung (zwei Ebenen):
+        1. Trend-/Divergenz-Kategorie in der Reihenfolge Aufwärtstrend
+           bestätigt -> Bullische Divergenz -> Abwärtstrend bestätigt ->
+           Bärische Divergenz -> alles andere (z. B. "Keine klare Richtung").
+        2. Innerhalb jeder Kategorie aufsteigend nach der vorzeichenbehafteten
+           Differenz zum Analystenkursziel (_diff_pct_sort): das sortiert
+           zunächst die am stärksten UNTER dem Kursziel liegenden Werte nach
+           vorn (größte Unterbewertung zuerst), dann Richtung 0 (Kurs = Ziel),
+           danach die ÜBER dem Kursziel liegenden Werte von der kleinsten bis
+           zur größten Überbewertung. Ticker ohne Analysten-Coverage (kein
+           Kursziel, _diff_pct_sort = NaN) werden dabei automatisch ans Ende
+           der jeweiligen Kategorie sortiert (pandas-Standardverhalten für
+           NaN bei aufsteigender Sortierung).
+
+    Die beiden internen Sortier-Hilfsspalten werden danach entfernt, sie
+    sollen weder in der Bildschirmanzeige noch im Excel-Export auftauchen.
+    """
+    sorted_df = result_df.sort_values(
+        by=["_trend_sort", "_diff_pct_sort"],
+        ascending=[True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    sorted_df = sorted_df.drop(columns=["_trend_sort", "_diff_pct_sort"])
+
+    # Spalten in die gewünschte Endreihenfolge bringen. Falls künftig eine
+    # Spalte entfällt/hinzukommt, robust bleiben: nur vorhandene Spalten aus
+    # COLUMN_ORDER übernehmen, danach eventuell verbleibende Spalten anhängen.
+    ordered_columns = [c for c in COLUMN_ORDER if c in sorted_df.columns]
+    remaining_columns = [c for c in sorted_df.columns if c not in ordered_columns]
+    return sorted_df[ordered_columns + remaining_columns]
 
 
 def build_display_dataframe(result_df: pd.DataFrame) -> pd.DataFrame:
@@ -805,6 +908,7 @@ def main() -> None:
         return
 
     result_df = pd.DataFrame(results)
+    result_df = sort_and_order_results(result_df)
 
     st.subheader("Ergebnis")
     st.dataframe(build_display_dataframe(result_df), use_container_width=True, hide_index=True)
